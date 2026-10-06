@@ -2,9 +2,13 @@
 
 状态图::
 
-    PENDING  -> RUNNING | CANCELLED
-    RUNNING  -> SUCCEEDED | FAILED | CANCELLED
+    PENDING       -> RUNNING | CANCELLED
+    RUNNING       -> SUCCEEDED | FAILED | CANCELLED | RETRY_WAITING
+    RETRY_WAITING -> RUNNING | CANCELLED
     SUCCEEDED / FAILED / CANCELLED 为终态，不得再被改写。
+
+``RETRY_WAITING`` 表示一次尝试已失败、正在按重试策略等待间隔，
+等待结束后迁移回 RUNNING 开始下一次尝试；等待期间也可以被取消。
 
 取消与完成几乎同时发生时，由存储层的条件更新（乐观锁）保证
 只有一个迁移生效，最终结论唯一且稳定。
@@ -21,7 +25,15 @@ logger = logging.getLogger("taskpipe.state_machine")
 _TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
     TaskState.PENDING: frozenset({TaskState.RUNNING, TaskState.CANCELLED}),
     TaskState.RUNNING: frozenset(
-        {TaskState.SUCCEEDED, TaskState.FAILED, TaskState.CANCELLED}
+        {
+            TaskState.SUCCEEDED,
+            TaskState.FAILED,
+            TaskState.CANCELLED,
+            TaskState.RETRY_WAITING,
+        }
+    ),
+    TaskState.RETRY_WAITING: frozenset(
+        {TaskState.RUNNING, TaskState.CANCELLED}
     ),
     TaskState.SUCCEEDED: frozenset(),
     TaskState.FAILED: frozenset(),
