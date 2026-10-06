@@ -16,7 +16,13 @@ from pydantic import BaseModel, Field
 
 from .config import Settings
 from .executor import Executor, Handler
-from .models import RejectReason, TaskState, TransitionError
+from .models import (
+    BackoffKind,
+    RejectReason,
+    RetryPolicy,
+    TaskState,
+    TransitionError,
+)
 from .service import ServiceRejected, TaskService
 from .store import TaskStore
 
@@ -42,10 +48,17 @@ def settings_from_env() -> Settings:
     )
 
 
+class RetryBody(BaseModel):
+    max_retries: int = Field(default=0, ge=0)
+    interval: float = Field(default=0.0, ge=0)
+    backoff: BackoffKind = BackoffKind.FIXED
+
+
 class SubmitBody(BaseModel):
     idempotency_key: str = Field(..., min_length=1)
     payload: dict = Field(default_factory=dict)
     request_id: str | None = None
+    retry: RetryBody | None = None
 
 
 class TaskView(BaseModel):
@@ -55,9 +68,17 @@ class TaskView(BaseModel):
     failure_reason: str | None
     result: object | None
     version: int
+    attempt_count: int
+    retries_remaining: int | None
+    next_run_at: float | None
 
 
 def _task_view(task, duplicated: bool | None = None) -> dict:
+    remaining = (
+        max(0, task.max_retries - task.attempt_count)
+        if task.max_retries > 0
+        else None
+    )
     view = {
         "task_id": task.task_id,
         "idempotency_key": task.idempotency_key,
@@ -67,10 +88,27 @@ def _task_view(task, duplicated: bool | None = None) -> dict:
         ),
         "result": task.result,
         "version": task.version,
+        "attempt_count": task.attempt_count,
+        "retries_remaining": remaining,
+        "next_run_at": task.next_run_at,
     }
     if duplicated is not None:
         view["duplicated"] = duplicated
     return view
+
+
+def _attempt_view(attempt) -> dict:
+    return {
+        "attempt_no": attempt.attempt_no,
+        "kind": attempt.kind.value,
+        "started_at": attempt.started_at,
+        "finished_at": attempt.finished_at,
+        "result": attempt.result.value if attempt.result else None,
+        "failure_reason": (
+            attempt.failure_reason.value if attempt.failure_reason else None
+        ),
+        "next_run_at": attempt.next_run_at,
+    }
 
 
 def default_handler(payload: dict) -> object:
@@ -92,13 +130,19 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # 中断恢复：上次 RUNNING 的任务 -> FAILED/INTERRUPTED；
-        # 仍 PENDING 的任务重新派发执行。
-        interrupted = store.recover_interrupted()
+        # 中断恢复：上次 RUNNING 的任务——被打断的一次计为一次尝试，
+        # 按重试策略决定 WAITING_RETRY（到期接着跑）或 FAILED/INTERRUPTED；
+        # 仍 PENDING 的任务重新派发；WAITING_RETRY 由调度线程自动续跑。
+        interrupted = store.recover_interrupted(executor.retry_decider)
         redispatched = executor.dispatch_pending()
         logger.info(
-            "startup recovery: interrupted=%s redispatched_pending=%s",
-            [t.task_id for t in interrupted], redispatched,
+            "startup recovery: resolved_running=%s redispatched_pending=%s",
+            [
+                {"task": t.task_id, "state": t.state.value,
+                 "next_run_at": t.next_run_at}
+                for t in interrupted
+            ],
+            redispatched,
         )
         yield
         executor.shutdown(wait=True)
@@ -125,8 +169,16 @@ def create_app(
     @app.post("/tasks", status_code=200)
     def submit(body: SubmitBody, request: Request) -> dict:
         rid = body.request_id or request.headers.get("X-Request-ID")
+        policy = None
+        if body.retry is not None:
+            policy = RetryPolicy(
+                max_retries=body.retry.max_retries,
+                interval=body.retry.interval,
+                backoff=body.retry.backoff,
+            )
         task, duplicated = service.submit(
-            body.idempotency_key, body.payload, request_id=rid
+            body.idempotency_key, body.payload,
+            request_id=rid, retry_policy=policy,
         )
         if not duplicated:
             executor.dispatch(task)
@@ -144,6 +196,19 @@ def create_app(
                 }},
             )
         return _task_view(task)
+
+    @app.get("/tasks/{task_id}/attempts")
+    def get_task_attempts(task_id: str):
+        try:
+            attempts = service.get_attempts(task_id)
+        except ServiceRejected as exc:
+            return JSONResponse(
+                status_code=404,
+                content={"error": {
+                    "reason": exc.reason.value, "message": str(exc),
+                }},
+            )
+        return {"task_id": task_id, "attempts": [_attempt_view(a) for a in attempts]}
 
     @app.post("/tasks/{task_id}/cancel")
     def cancel(task_id: str, request: Request):

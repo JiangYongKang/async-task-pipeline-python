@@ -146,3 +146,123 @@ def test_restart_recovers_interrupted_task(tmp_db, request_id):
             "reason=INTERRUPTED（状态确定且可查询）",
             request_id, task.task_id,
         )
+
+
+def test_retry_submit_and_attempts_endpoint(tmp_db, request_id):
+    calls = {"n": 0}
+    import threading as _t
+    lock = _t.Lock()
+
+    def flaky(payload):
+        with lock:
+            calls["n"] += 1
+            n = calls["n"]
+        if n == 1:
+            raise RuntimeError("transient")
+        return {"n": n}
+
+    settings = Settings(db_path=tmp_db, handler_timeout=5)
+    app = create_app(settings, handler=flaky)
+    with TestClient(app) as client:
+        r = client.post(
+            "/tasks",
+            json={
+                "idempotency_key": "retry-k",
+                "payload": {},
+                "retry": {"max_retries": 2, "interval": 0.05,
+                          "backoff": "FIXED"},
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["state"] == "PENDING"
+        assert body["attempt_count"] == 0
+        assert body["retries_remaining"] == 2
+        task_id = body["task_id"]
+
+        final = _wait_state(client, task_id, "SUCCEEDED")
+        assert final["result"] == {"n": 2}
+        assert final["attempt_count"] == 2
+        assert final["retries_remaining"] == 0
+
+        ra = client.get(f"/tasks/{task_id}/attempts")
+        assert ra.status_code == 200
+        attempts = ra.json()["attempts"]
+        assert [a["attempt_no"] for a in attempts] == [1, 2]
+        assert attempts[0]["kind"] == "INITIAL"
+        assert attempts[0]["result"] == "FAILURE"
+        assert attempts[0]["failure_reason"] == "HANDLER_ERROR"
+        assert attempts[0]["next_run_at"] is not None
+        assert attempts[1]["kind"] == "RETRY"
+        assert attempts[1]["result"] == "SUCCESS"
+        logger.info(
+            "request=%s decision verified: /attempts 可追溯每次尝试 task=%s",
+            request_id, task_id,
+        )
+
+
+def test_attempts_endpoint_unknown_task_404(tmp_db, request_id):
+    app = create_app(Settings(db_path=tmp_db, handler_timeout=5))
+    with TestClient(app) as client:
+        r = client.get("/tasks/nope/attempts")
+        assert r.status_code == 404
+        assert r.json()["error"]["reason"] == "TASK_NOT_FOUND"
+
+
+def test_exponential_backoff_fields_accepted(tmp_db, request_id):
+    settings = Settings(db_path=tmp_db, handler_timeout=5)
+    app = create_app(settings, handler=lambda p: {"echo": p})
+    with TestClient(app) as client:
+        r = client.post(
+            "/tasks",
+            json={
+                "idempotency_key": "bk",
+                "retry": {"max_retries": 3, "interval": 0.1,
+                          "backoff": "EXPONENTIAL"},
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["retries_remaining"] == 3
+        _wait_state(client, r.json()["task_id"], "SUCCEEDED")
+
+
+def test_restart_resumes_waiting_retry_task(tmp_db, request_id):
+    """端到端重启：WAITING_RETRY 任务在新实例启动后按原计划自动续跑。"""
+    import threading as _t
+    from taskpipe.models import RetryPolicy
+    from taskpipe.models import TaskState
+
+    calls = {"n": 0}
+    lock = _t.Lock()
+
+    def fail_once(payload):
+        with lock:
+            calls["n"] += 1
+            n = calls["n"]
+        if n == 1:
+            raise RuntimeError("first fails")
+        return {"n": n}
+
+    settings = Settings(db_path=tmp_db, handler_timeout=5)
+    app = create_app(settings, handler=fail_once)
+    task_id = None
+    with TestClient(app) as client:
+        body = client.post(
+            "/tasks",
+            json={"idempotency_key": "rk",
+                  "retry": {"max_retries": 2, "interval": 0.3}},
+        ).json()
+        task_id = body["task_id"]
+        _wait_state(client, task_id, "WAITING_RETRY")
+        # with 退出触发应用关闭（执行器停机），模拟服务停止
+    logger.info("request=%s 第一个实例关闭，任务停在 WAITING_RETRY", request_id)
+
+    app2 = create_app(settings, handler=fail_once)
+    with TestClient(app2) as client2:
+        final = _wait_state(client2, task_id, "SUCCEEDED")
+        assert final["attempt_count"] == 2
+        assert final["result"] == {"n": 2}
+        logger.info(
+            "request=%s decision verified: 重启后 WAITING_RETRY 自动续跑成功",
+            request_id,
+        )
